@@ -1,110 +1,85 @@
-from backtesting import Backtest, Strategy
-import talib
 import pandas as pd
+import numpy as np
+import scipy.signal as signal
+import talib
+from backtesting import Backtest, Strategy
+from backtesting.lib import crossover
 
-# Load data
+# Load the data
 df = pd.read_csv('combined_ohlc_data.csv', parse_dates=['Date'], index_col='Date')
 
 
-# Define custom indicators
-def MACD(close, n1, n2, ns):
-    macd, macdsignal, macdhist = talib.MACD(close, fastperiod=n1, slowperiod=n2, signalperiod=ns)
-    return macd, macdsignal
+# Strategy to trade based on support and resistance
+class SupportResistanceStrategy(Strategy):
 
+    def identify_resistance_levels(self, high_prices, distance=60, prominence=20):
+        # Find peaks in the 'high' price data
+        peaks, _ = signal.find_peaks(high_prices, distance=distance, prominence=prominence)
+        # Use numpy-style indexing instead of iloc
+        peak_values = high_prices[peaks].tolist()
+        return peaks, peak_values
 
-def STOCH(high, low, close):
-    slowk, slowd = talib.STOCH(high, low, close, fastk_period=14, slowk_period=12, slowk_matype=0, slowd_period=3,
-                               slowd_matype=0)
-    return slowk, slowd
+    def identify_support_levels(self, low_prices, distance=60, prominence=20):
+        # Find troughs (peaks of the negative low prices)
+        troughs, _ = signal.find_peaks(-low_prices, distance=distance, prominence=prominence)
+        # Use numpy-style indexing instead of iloc
+        trough_values = low_prices[troughs].tolist()
+        return troughs, trough_values
 
+    def is_level_valid(self, current_index, level_index, expiry_period):
+        # Check if the level is within the expiry period
+        if (current_index - level_index) <= expiry_period:
+            return True
+        return False
 
-def VWAP(hi, lo, cls, vol):
-    VWAP = (((hi + lo + cls) / 3) * vol).cumsum() / vol.cumsum()
-    return VWAP
+    def merge_levels(self, levels, threshold=20):
+        # Sort and merge levels that are within a certain threshold
+        levels = sorted(levels)
+        merged = []
+        current_bin = [levels[0]]
 
+        for i in range(1, len(levels)):
+            # If the current level is within the threshold of the last merged level, add it to the current bin
+            if levels[i] - current_bin[-1] < threshold:
+                current_bin.append(levels[i])
+            else:
+                # If the level is far from the current bin, add the mean of the current bin to the merged levels
+                merged.append(np.mean(current_bin))
+                current_bin = [levels[i]]
 
-def atr(high, low, close):
-    atr = talib.ATR(high, low, close, 7)
-    return atr
-
-
-# Calculate indicators
-df["EMA_Slow"] = talib.EMA(df.Close, 50)
-df["EMA_Fast"] = talib.EMA(df.Close, 30)
-df['ATR'] = talib.ATR(df.High, df.Low, df.Close, 7)
-
-bband = talib.BBANDS(df.Close, timeperiod=15, nbdevup=1.5, nbdevdn=2, matype=0)
-bband_df = pd.DataFrame({
-    'Upper_BB': bband[0],
-    'Middle_BB': bband[1],
-    'Lower_BB': bband[2]
-}, index=df.index)
-df = df.join(bband_df)
-
-
-# Function for EMA crossover signal
-def emasignal(close, current_index, backcandles=6):
-    start_index = max(0, current_index - backcandles)
-    slow_ema = close["EMA_Slow"][start_index:current_index]
-    fast_ema = close["EMA_Fast"][start_index:current_index]
-    signal = 0
-    if all(f > s for f, s in zip(fast_ema, slow_ema)):
-        signal = 1
-    elif all(s > f for f, s in zip(fast_ema, slow_ema)):
-        signal = 2
-    return signal
-
-
-# Function for the combined signals
-def total_signal(df, current_candle, backcandles):
-    if (emasignal(df, current_candle, backcandles) == 2 and df.Close[current_candle] <= df['Lower_BB'][current_candle]):
-        return 2
-    if (emasignal(df, current_candle, backcandles) == 1 and df.Close[current_candle] >= df['Upper_BB'][current_candle]):
-        return 1
-    else:
-        return 0
-
-
-df["EMABBSignal"] = [total_signal(df, i, 6) for i in range(len(df))]
-
-
-# Define the strategy
-class Main(Strategy):
-    slcoef = 43  # Reduced risk per trade
-    TPSLRatio = 1.5  # Adjusted risk-to-reward ratio
-    limit = 66
-    size = 50000
+        # Add the last bin's mean value
+        merged.append(np.mean(current_bin))
+        return merged
 
     def init(self):
-        self.emabbsignal = self.I(lambda: df.EMABBSignal)
-        self.RSI = self.I(talib.RSI, self.data.Close, 14)
-        self.ATR = self.I(atr, self.data.High, self.data.Low, self.data.Close)
-        self.macd, self.macd_signal = self.I(MACD, self.data.Close, 12, 26, 9)
+        # Calculate initial resistance and support levels
+        self.resistance_indices, self.resistance_levels = self.identify_resistance_levels(self.data.High, distance=60, prominence=20)
+        self.support_indices, self.support_levels = self.identify_support_levels(self.data.Low, distance=60, prominence=20)
+
+        # Merge levels based on threshold
+        self.resistance_levels = self.merge_levels(self.resistance_levels, threshold=20)
+        self.support_levels = self.merge_levels(self.support_levels, threshold=20)
+
+        # Store Exponential Moving Averages
+        self.EMA_Slow = self.I(talib.EMA, self.data.Close, 50)
+        self.EMA_Fast = self.I(talib.EMA, self.data.Close, 30)
+
+        # Define how many candles the levels should be valid for
+        self.expiry_period = 20
+
+        # Track valid levels within the expiry period
+        self.valid_support_levels = []
+        self.valid_resistance_levels = []
 
     def next(self):
-        slatr = self.slcoef * self.data.ATR[-1]
-        TPSLRatio = self.TPSLRatio
-
-        # Buying conditions
-        if self.emabbsignal[-1] == 2 and len(self.trades) == 0 and self.RSI[-1] < self.limit and self.macd[-1] > \
-                self.macd_signal[-1]:
-            sl1 = self.data.Close[-1] - slatr
-            tp1 = self.data.Close[-1] + slatr * TPSLRatio
-            self.buy(sl=sl1, tp=tp1)
-
-        # Selling conditions
-        elif self.emabbsignal[-1] == 1 and len(self.trades) == 0 and self.RSI[-1] > self.limit and self.macd[-1] < \
-                self.macd_signal[-1]:
-            sl2 = self.data.Close[-1] + slatr
-            tp2 = self.data.Close[-1] - slatr * TPSLRatio
-            self.sell(sl=sl2, tp=tp2)
+        current_price = self.data.Close[-1]
+        current_index = len(self.data) - 1  # Current index in the dataframe
+        
 
 
-# Run the backtest with optimization
+# Backtest
 if __name__ == '__main__':
-    bt = Backtest(df, Main, cash=50_000)
-    #stats = bt.optimize(TPSLRatio=[i for i in range(1, 10)], maximize='Return [%]')
-    stats=bt.run()
-    bt.plot()
-    print(stats)
+    bt = Backtest(df, SupportResistanceStrategy, cash=50_000, commission=.002)
+    stats = bt.run()
 
+    print(stats)
